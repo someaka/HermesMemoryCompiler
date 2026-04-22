@@ -1,0 +1,34 @@
+ollama:
+  base_url: "http://localhost:11434/v1"
+  model: "kimi-k2.6:cloud"
+
+flush:
+  temperature: 0.2
+  max_tokens: 2048
+  min_turns_before_flush: 3
+  max_messages_per_flush: 50
+
+compiler:
+  temperature: 0.3
+  max_tokens: 4096
+  max_turns: 30
+  context_article_threshold: 150
+  system_prompt: "compiler"
+
+query:
+  temperature: 0.2
+  max_tokens: 2048
+
+lint:
+  structural_only: false
+  contradiction_temperature: 0.1
+  contradiction_max_tokens: 2048
+
+plugin:
+  auto_flush: true  # Set to false to disable automatic session-end flush
+  # wiki_path is auto-derived from project root; override only if needed
+  # wiki_path: "/custom/path"
+  marker_dir: "~/.hermes/plugins/hermes-memory-compiler/markers"
+  auto_compile_hour: 18
+  max_context_chars: 20000
+  max_log_lines: 30

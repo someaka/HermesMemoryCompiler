@@ -1,0 +1,19 @@
+[project]
+name = "hermes-memory-compiler"
+version = "0.1.0"
+description = "Personal knowledge base compiler for Hermes Agent conversations"
+requires-python = ">=3.12"
+dependencies = [
+    "pyyaml>=6.0",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
