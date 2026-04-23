@@ -24,9 +24,6 @@ from typing import Any, Optional
 import requests
 
 
-import yaml
-
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT_DIR / "scripts"
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -71,6 +68,7 @@ If nothing worth saving: respond with exactly FLUSH_OK.
 
 def get_config() -> dict[str, Any]:
     """Load config.yaml from project root, falling back to hard-coded defaults."""
+    import yaml
     config_path = ROOT_DIR / "config.yaml"
     config = {k: dict(v) for k, v in DEFAULT_CONFIG.items()}
     if config_path.exists():
@@ -201,8 +199,8 @@ def _should_skip_dedup(session_id: str) -> bool:
             delta = (datetime.now() - last_dt).total_seconds()
             if delta < 60:
                 return True
-    except Exception:
-        pass
+    except (json.JSONDecodeError, OSError, KeyError) as e:
+        print(f"Warning: could not read last-flush.json: {e}", file=sys.stderr)
     return False
 
 
@@ -214,8 +212,8 @@ def _write_last_flush(session_id: str) -> None:
         try:
             with open(last_flush_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Warning: could not read last-flush.json: {e}", file=sys.stderr)
     if "sessions" not in data or not isinstance(data.get("sessions"), dict):
         data["sessions"] = {}
     data["sessions"][session_id] = datetime.now().isoformat()
@@ -238,8 +236,8 @@ def _maybe_trigger_compile(daily_path: Path, config: dict[str, Any]) -> None:
         try:
             with open(state_path, "r", encoding="utf-8") as f:
                 state = json.load(f)
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Warning: could not read state.json: {e}", file=sys.stderr)
 
     last_hash = state.get("last_compile_hash", "")
 

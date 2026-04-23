@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 from config import DAILY_DIR, KNOWLEDGE_DIR, ROOT_DIR, cfg, ollama_completion
+from hermes_plugin.lock import LockHeldError, acquire_lock, release_lock
 from utils import (
     file_hash,
     list_raw_files,
@@ -161,8 +162,8 @@ def _tool_grep(pattern: str, path: str) -> str:
                 for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
                     if _re.search(pattern, line):
                         results.append(f"{f}:{i}:{line}")
-            except Exception:
-                pass
+            except (OSError, PermissionError, UnicodeDecodeError) as e:
+                results.append(f"{f}:Error reading file: {e}")
     except Exception as e:
         return f"Error during grep: {e}"
     return "\n".join(results[:100]) if results else "(no matches)"
@@ -187,9 +188,12 @@ def execute_tool(call: dict) -> str:
     return f"Unknown tool: {name}"
 
 
-def compile_daily_log(log_path: Path, state: dict) -> float:
+def compile_daily_log(log_path: Path, state: dict) -> None:
     """Compile a single daily log into knowledge articles."""
     log_content = log_path.read_text(encoding="utf-8")
+    if not AGENTS_FILE.exists():
+        print(f"Error: AGENTS.md not found at {AGENTS_FILE}")
+        return
     schema = AGENTS_FILE.read_text(encoding="utf-8")
     wiki_index = read_wiki_index()
     timestamp = now_iso()
@@ -200,7 +204,8 @@ def compile_daily_log(log_path: Path, state: dict) -> float:
         "You have access to file tools. Use them precisely. "
         "Write complete YAML frontmatter for every article. "
         "Use Obsidian-style [[path/to/article]] wikilinks. "
-        "When done, do not make further tool calls."
+        "When done, do not make further tool calls. "
+        "Every article you create or update must include tags: [Hermes] in its YAML frontmatter, preserving any existing tags."
     )
 
     prompt = f"""## Schema (AGENTS.md)
@@ -243,6 +248,7 @@ Read the daily log above and compile it into wiki articles following the schema 
    - Articles created: [[concepts/x]], [[concepts/y]]
    - Articles updated: [[concepts/z]] (if any)
    ```
+7. **Tag all articles** - Every concept, connection, and Q&A article must have `tags: [Hermes]` in its YAML frontmatter. When updating existing articles, append `Hermes` to the existing tags list without removing other tags.
 
 ### File paths:
 - Write concept articles to: {CONCEPTS_DIR}
@@ -275,7 +281,7 @@ Read the daily log above and compile it into wiki articles following the schema 
             )
         except RuntimeError as e:
             print(f"  API error: {e}")
-            return 0.0
+            return
 
         choice = resp.get("choices", [{}])[0]
         message = choice.get("message", {})
@@ -303,17 +309,15 @@ Read the daily log above and compile it into wiki articles following the schema 
             })
     else:
         print(f"  Warning: reached max_turns ({max_turns})")
-        return 0.0
+        return
 
     # Update state
     rel_path = log_path.name
     state.setdefault("ingested", {})[rel_path] = {
         "hash": file_hash(log_path),
         "compiled_at": now_iso(),
-        "cost_usd": 0.0,
     }
     save_state(state)
-    return 0.0
 
 
 def main():
@@ -323,57 +327,66 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Show what would be compiled")
     args = parser.parse_args()
 
-    state = load_state()
+    try:
+        acquire_lock(KNOWLEDGE_DIR, "hermes")
+    except LockHeldError as exc:
+        print(f"Error: Compilation lock held by {exc.agent_name} since {exc.timestamp} (pid {exc.pid})")
+        sys.exit(2)
 
-    if args.file:
-        target = Path(args.file)
-        if not target.is_absolute():
-            target = DAILY_DIR / target.name
-        if not target.exists():
-            target = ROOT_DIR / args.file
-        if not target.exists():
-            print(f"Error: {args.file} not found")
-            sys.exit(1)
-        to_compile = [target]
-    else:
-        all_logs = list_raw_files()
-        if args.all:
-            to_compile = all_logs
+    try:
+        state = load_state()
+
+        if args.file:
+            target = Path(args.file)
+            if not target.is_absolute():
+                target = DAILY_DIR / target.name
+            if not target.exists():
+                target = ROOT_DIR / args.file
+            if not target.exists():
+                print(f"Error: {args.file} not found")
+                sys.exit(1)
+            to_compile = [target]
         else:
-            to_compile = []
-            for log_path in all_logs:
-                rel = log_path.name
-                prev = state.get("ingested", {}).get(rel, {})
-                if not prev or prev.get("hash") != file_hash(log_path):
-                    to_compile.append(log_path)
+            all_logs = list_raw_files()
+            if args.all:
+                to_compile = all_logs
+            else:
+                to_compile = []
+                for log_path in all_logs:
+                    rel = log_path.name
+                    prev = state.get("ingested", {}).get(rel, {})
+                    if not prev or prev.get("hash") != file_hash(log_path):
+                        to_compile.append(log_path)
 
-    if not to_compile:
-        print("Nothing to compile - all daily logs are up to date.")
-        return
+        if not to_compile:
+            print("Nothing to compile - all daily logs are up to date.")
+            return
 
-    print(f"{'[DRY RUN] ' if args.dry_run else ''}Files to compile ({len(to_compile)}):")
-    for f in to_compile:
-        print(f"  - {f.name}")
+        print(f"{'[DRY RUN] ' if args.dry_run else ''}Files to compile ({len(to_compile)}):")
+        for f in to_compile:
+            print(f"  - {f.name}")
 
-    if args.dry_run:
-        return
+        if args.dry_run:
+            return
 
-    for i, log_path in enumerate(to_compile, 1):
-        print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
-        compile_daily_log(log_path, state)
-        # Archive the daily log after successful compilation
-        archive_dir = DAILY_DIR / "archive"
-        archive_path = archive_dir / log_path.name
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        if archive_path.exists():
-            print(f"  Warning: {archive_path.name} already exists in archive, overwriting.")
-        shutil.move(str(log_path), str(archive_path))
-        print(f"  Archived {log_path.name} -> daily/archive/{log_path.name}")
-        print("  Done.")
+        for i, log_path in enumerate(to_compile, 1):
+            print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
+            compile_daily_log(log_path, state)
+            # Archive the daily log after successful compilation
+            archive_dir = DAILY_DIR / "archive"
+            archive_path = archive_dir / log_path.name
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            if archive_path.exists():
+                print(f"  Warning: {archive_path.name} already exists in archive, overwriting.")
+            shutil.move(str(log_path), str(archive_path))
+            print(f"  Archived {log_path.name} -> daily/archive/{log_path.name}")
+            print("  Done.")
 
-    articles = list(list_wiki_articles())
-    print(f"\nCompilation complete.")
-    print(f"Knowledge base: {len(articles)} articles")
+        articles = list(list_wiki_articles())
+        print(f"\nCompilation complete.")
+        print(f"Knowledge base: {len(articles)} articles")
+    finally:
+        release_lock(KNOWLEDGE_DIR)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ import sys
 from typing import Any
 
 from config import DAILY_DIR, KNOWLEDGE_DIR, ROOT_DIR, STATE_PATH, cfg, ollama_completion
+from hermes_plugin.lock import LockHeldError, acquire_lock, release_lock
 from utils import extract_wikilinks, list_wiki_articles
 
 _WORD_RE = re.compile(r"\b\w+\b")
@@ -289,26 +290,35 @@ def main() -> int:
     parser.add_argument("--output", type=str, default=None, help="Write report to file")
     args = parser.parse_args()
 
-    issues = run_checks()
-    if not args.structural_only:
-        issues["contradictions"] = _check_contradictions()
+    try:
+        acquire_lock(KNOWLEDGE_DIR, "hermes")
+    except LockHeldError as exc:
+        print(f"Error: Compilation lock held by {exc.agent_name} since {exc.timestamp} (pid {exc.pid})")
+        return 2
 
-    report = format_report(issues, args.structural_only)
+    try:
+        issues = run_checks()
+        if not args.structural_only:
+            issues["contradictions"] = _check_contradictions()
 
-    if args.output:
-        pathlib.Path(args.output).write_text(report, encoding="utf-8")
-    else:
-        today = datetime.date.today().isoformat()
-        default_path = ROOT_DIR / "reports" / f"lint-{today}.md"
-        default_path.parent.mkdir(parents=True, exist_ok=True)
-        default_path.write_text(report, encoding="utf-8")
-        print(report)
+        report = format_report(issues, args.structural_only)
 
-    # Return non-zero if any errors exist
-    error_count = sum(
-        1 for items in issues.values() for item in items if item.get("severity") == "error"
-    )
-    return 1 if error_count > 0 else 0
+        if args.output:
+            pathlib.Path(args.output).write_text(report, encoding="utf-8")
+        else:
+            today = datetime.date.today().isoformat()
+            default_path = ROOT_DIR / "reports" / f"lint-{today}.md"
+            default_path.parent.mkdir(parents=True, exist_ok=True)
+            default_path.write_text(report, encoding="utf-8")
+            print(report)
+
+        # Return non-zero if any errors exist
+        error_count = sum(
+            1 for items in issues.values() for item in items if item.get("severity") == "error"
+        )
+        return 1 if error_count > 0 else 0
+    finally:
+        release_lock(KNOWLEDGE_DIR)
 
 
 if __name__ == "__main__":

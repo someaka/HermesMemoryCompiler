@@ -7,23 +7,13 @@ from typing import Any
 import requests
 import yaml
 
-# Path constants
-ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
-DAILY_DIR = ROOT_DIR / "daily"
-KNOWLEDGE_DIR = ROOT_DIR / "knowledge"
-SCRIPTS_DIR = ROOT_DIR / "scripts"
-REPORTS_DIR = ROOT_DIR / "reports"
-STATE_PATH = SCRIPTS_DIR / "state.json"
-LAST_FLUSH_PATH = SCRIPTS_DIR / "last-flush.json"
-CONFIG_PATH = ROOT_DIR / "config.yaml"
-
-
-def _load_config() -> dict[str, Any]:
-    with CONFIG_PATH.open("r", encoding="utf-8") as f:
+def _load_config(path: pathlib.Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
-CONFIG = _load_config()
+CONFIG_PATH = pathlib.Path(__file__).resolve().parent.parent / "config.yaml"
+CONFIG = _load_config(CONFIG_PATH)
 
 
 def cfg(path: str, default: Any = None) -> Any:
@@ -36,6 +26,16 @@ def cfg(path: str, default: Any = None) -> Any:
         if node is None:
             return default
     return node
+
+
+# Path constants
+ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
+DAILY_DIR = ROOT_DIR / "daily"
+KNOWLEDGE_DIR = pathlib.Path(cfg("plugin.wiki_path", str(ROOT_DIR / "knowledge"))).expanduser()
+SCRIPTS_DIR = ROOT_DIR / "scripts"
+REPORTS_DIR = ROOT_DIR / "reports"
+STATE_PATH = SCRIPTS_DIR / "state.json"
+LAST_FLUSH_PATH = SCRIPTS_DIR / "last-flush.json"
 
 
 def ollama_completion(

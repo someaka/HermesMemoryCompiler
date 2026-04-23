@@ -10,6 +10,7 @@ import argparse
 import json
 import logging
 import pathlib
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -133,6 +134,64 @@ def _kbq_handler(raw_args: str) -> Optional[str]:
     return output if output else "KB query produced no output."
 
 
+def _mcompile_handler(raw_args: str) -> Optional[str]:
+    """Handle ``/mcompile [--all|--file <path>|--dry-run]`` in-session slash command."""
+    args = shlex.split(raw_args.strip()) if raw_args.strip() else []
+    cmd = [sys.executable, "scripts/compile.py"]
+
+    if "--all" in args:
+        cmd.append("--all")
+    elif "--dry-run" in args:
+        cmd.append("--dry-run")
+
+    for i, arg in enumerate(args):
+        if arg == "--file" and i + 1 < len(args):
+            cmd.extend(["--file", args[i + 1]])
+
+    result = subprocess.run(cmd, cwd=ROOT_DIR, capture_output=True, text=True)
+    output = result.stdout.strip()
+    if result.returncode != 0 and result.stderr:
+        output += f"\n(stderr: {result.stderr.strip()})"
+    return output if output else "mcompile produced no output."
+
+
+def _mlint_handler(raw_args: str) -> Optional[str]:
+    """Handle ``/mlint [--structural-only]`` in-session slash command."""
+    args = shlex.split(raw_args.strip()) if raw_args.strip() else []
+    cmd = [sys.executable, "scripts/lint.py"]
+
+    if "--structural-only" in args:
+        cmd.append("--structural-only")
+
+    result = subprocess.run(cmd, cwd=ROOT_DIR, capture_output=True, text=True)
+    output = result.stdout.strip()
+    if result.returncode != 0 and result.stderr:
+        output += f"\n(stderr: {result.stderr.strip()})"
+    return output if output else "mlint produced no output."
+
+
+def _mquery_handler(raw_args: str) -> Optional[str]:
+    """Handle ``/mquery [--file-back] <question>`` in-session slash command."""
+    args = shlex.split(raw_args.strip()) if raw_args.strip() else []
+    if not args:
+        return "Usage: /mquery [--file-back] <question>"
+
+    file_back = "--file-back" in args
+    filtered = [a for a in args if a != "--file-back"]
+    if not filtered:
+        return "Usage: /mquery [--file-back] <question>"
+
+    cmd = [sys.executable, "scripts/query.py"] + filtered
+    if file_back:
+        cmd.append("--file-back")
+
+    result = subprocess.run(cmd, cwd=ROOT_DIR, capture_output=True, text=True)
+    output = result.stdout.strip()
+    if result.returncode != 0 and result.stderr:
+        output += f"\n(stderr: {result.stderr.strip()})"
+    return output if output else "mquery produced no output."
+
+
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
@@ -148,6 +207,9 @@ def register(ctx) -> None:
     Commands:
         - ``hermes kb`` CLI with subcommands compile, lint, query, flush, status
         - ``/kbq`` in-session slash command
+        - ``/mcompile`` in-session slash command
+        - ``/mlint`` in-session slash command
+        - ``/mquery`` in-session slash command
     """
     ctx.register_hook("pre_llm_call", hooks.on_pre_llm_call)
     ctx.register_hook("post_llm_call", hooks.on_post_llm_call)
@@ -173,4 +235,22 @@ def register(ctx) -> None:
         name="kbq",
         handler=_kbq_handler,
         description="Query the knowledge base from within a conversation.",
+    )
+
+    ctx.register_command(
+        name="mcompile",
+        handler=_mcompile_handler,
+        description="Run the knowledge compilation engine from within a conversation.",
+    )
+
+    ctx.register_command(
+        name="mlint",
+        handler=_mlint_handler,
+        description="Lint the knowledge base from within a conversation.",
+    )
+
+    ctx.register_command(
+        name="mquery",
+        handler=_mquery_handler,
+        description="Query the knowledge base with optional --file-back from within a conversation.",
     )

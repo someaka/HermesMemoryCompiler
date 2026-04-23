@@ -25,9 +25,8 @@ lint:
   contradiction_max_tokens: 2048
 
 plugin:
-  auto_flush: true  # Set to false to disable automatic session-end flush
-  # wiki_path is auto-derived from project root; override only if needed
-  # wiki_path: "/custom/path"
+  auto_flush: true
+  wiki_path: "knowledge"
   marker_dir: "~/.hermes/plugins/hermes-memory-compiler/markers"
   auto_compile_hour: 18
   max_context_chars: 20000

@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Hermes / IDE
+.hermes/
+.obsidian/
+
+# Runtime state
+scripts/state.json
+scripts/last-flush.json
+scripts/*.log
+
+# Reports
+reports/*.md
+
+# Daily logs (user data)
+daily/*.md
+!daily/.gitkeep
+
+# Knowledge base (user data)
+knowledge/**/*.md
+!knowledge/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
