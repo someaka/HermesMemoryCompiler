@@ -21,6 +21,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
 
 from scripts.config import DAILY_DIR, KNOWLEDGE_DIR, ROOT_DIR, cfg, ollama_completion
+from hermes_memory_compiler.lock import LockHeldError, acquire_lock, release_lock
 from scripts.utils import (
     file_hash,
     list_raw_files,
