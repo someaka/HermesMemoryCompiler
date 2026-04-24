@@ -11,7 +11,7 @@ import tempfile
 from datetime import datetime, timezone
 from typing import Iterator
 
-from config import KNOWLEDGE_DIR
+from scripts.config import KNOWLEDGE_DIR
 
 _WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
@@ -34,16 +34,22 @@ def atomic_write(path: str | os.PathLike, content: str) -> None:
     dest = pathlib.Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=f".tmp-{dest.name}-")
+    success = False
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
         os.replace(tmp, dest)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        raise
+        success = True
+    finally:
+        if not success:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
 
 
 def atomic_json_write(path: str | os.PathLike, data: object) -> None:
@@ -108,7 +114,7 @@ file_hash = hash_file
 
 def list_raw_files() -> list[pathlib.Path]:
     """Return all .md files in the daily/ directory, sorted by name."""
-    from config import DAILY_DIR
+    from scripts.config import DAILY_DIR
 
     if not DAILY_DIR.exists():
         return []
@@ -117,16 +123,16 @@ def list_raw_files() -> list[pathlib.Path]:
 
 def load_state() -> dict:
     """Load compilation state from scripts/state.json."""
-    from config import STATE_PATH
+    from scripts.config import STATE_PATH
 
     if not STATE_PATH.exists():
-        return {"ingested": {}, "total_cost": 0.0}
+        return {"ingested": {}}
     with STATE_PATH.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def save_state(data: dict) -> None:
     """Save compilation state to scripts/state.json."""
-    from config import STATE_PATH
+    from scripts.config import STATE_PATH
 
     atomic_json_write(STATE_PATH, data)

@@ -20,11 +20,20 @@ import re
 import sys
 from typing import Any
 
-from config import DAILY_DIR, KNOWLEDGE_DIR, ROOT_DIR, STATE_PATH, cfg, ollama_completion
-from hermes_plugin.lock import LockHeldError, acquire_lock, release_lock
-from utils import extract_wikilinks, list_wiki_articles
+from pathlib import Path
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent))
+
+from scripts.config import DAILY_DIR, KNOWLEDGE_DIR, ROOT_DIR, cfg, ollama_completion
+from hermes_memory_compiler.lock import LockHeldError, acquire_lock, release_lock
+from scripts.utils import atomic_write, extract_wikilinks, hash_file, list_wiki_articles, load_state, now_iso, save_state
 
 _WORD_RE = re.compile(r"\b\w+\b")
+
+# Maximum characters to feed to the contradiction-check LLM.
+# This is a pragmatic limit based on typical 2048-token output budgets
+# and the need to keep prompt + response within context window.
+MAX_CONTRADICTION_CHARS = 120_000
 
 
 def _resolve_link(link: str) -> pathlib.Path | None:
@@ -56,18 +65,15 @@ def _resolve_link(link: str) -> pathlib.Path | None:
 
 
 def _is_article(path: pathlib.Path) -> bool:
-    return KNOWLEDGE_DIR in path.resolve().parents or path.resolve().parent == KNOWLEDGE_DIR
+    resolved = path.resolve()
+    if KNOWLEDGE_DIR in resolved.parents or resolved.parent == KNOWLEDGE_DIR:
+        return True
+    abs_path = path.absolute()
+    return KNOWLEDGE_DIR in abs_path.parents or abs_path.parent == KNOWLEDGE_DIR
 
 
 def _word_count(text: str) -> int:
     return len(_WORD_RE.findall(text))
-
-
-def _load_state() -> dict[str, Any]:
-    if not STATE_PATH.exists():
-        return {}
-    with STATE_PATH.open("r", encoding="utf-8") as f:
-        return json.load(f)
 
 
 def run_checks() -> dict[str, list[dict[str, Any]]]:
@@ -81,7 +87,7 @@ def run_checks() -> dict[str, list[dict[str, Any]]]:
         "contradictions": [],
     }
 
-    state = _load_state()
+    state = load_state()
     ingested: dict[str, Any] = state.get("ingested", {})
 
     # Gather all knowledge articles
@@ -146,7 +152,6 @@ def run_checks() -> dict[str, list[dict[str, Any]]]:
         if not daily_path.exists():
             continue
         stored_hash = meta.get("hash", "")
-        from utils import hash_file
         current_hash = hash_file(daily_path)
         if current_hash != stored_hash:
             # Find articles that list this daily as a source
@@ -243,8 +248,8 @@ def _check_contradictions() -> list[dict[str, Any]]:
         return []
 
     full_text = "\n\n".join(contents)
-    if len(full_text) > 120_000:
-        full_text = full_text[:120_000] + "\n\n[Additional articles truncated due to length]"
+    if len(full_text) > MAX_CONTRADICTION_CHARS:
+        full_text = full_text[:MAX_CONTRADICTION_CHARS] + "\n\n[Additional articles truncated due to length]"
     prompt = (
         "You are a knowledge base auditor. Below are all knowledge base articles. "
         "Identify any pairs of claims that directly contradict each other.\n\n"
@@ -264,8 +269,31 @@ def _check_contradictions() -> list[dict[str, Any]]:
             temperature=cfg("lint.contradiction_temperature", 0.2),
             max_tokens=cfg("lint.contradiction_max_tokens", 2048),
         )
-        content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-        match = re.search(r"\[.*\]", content, re.DOTALL)
+        choices = resp.get("choices")
+        if not choices:
+            return [{
+                "severity": "warning",
+                "file": "contradiction-check",
+                "message": "Ollama returned empty choices for contradiction check",
+            }]
+        content = choices[0].get("message", {}).get("content", "")
+        # Try to parse the entire response first; fall back to regex extraction
+        # because some models wrap the JSON in markdown fences or prose.
+        stripped = content.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            data = json.loads(stripped)
+            if isinstance(data, list):
+                issues = []
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    issues.append({
+                        "severity": "warning",
+                        "file": f"{item.get('article_a', '?')} vs {item.get('article_b', '?')}",
+                        "message": f"Contradiction: {item.get('claim_a', '?')} vs {item.get('claim_b', '?')}",
+                    })
+                return issues
+        match = re.search(r"\[.*?\]", content, re.DOTALL)
         if match:
             data = json.loads(match.group(0))
             if isinstance(data, list):
@@ -279,8 +307,12 @@ def _check_contradictions() -> list[dict[str, Any]]:
                         "message": f"Contradiction: {item.get('claim_a', '?')} vs {item.get('claim_b', '?')}",
                     })
                 return issues
-    except Exception as exc:
-        print(f"Warning: contradiction check failed ({exc}).", file=sys.stderr)
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        return [{
+            "severity": "warning",
+            "file": "contradiction-check",
+            "message": f"Contradiction check failed: {exc}",
+        }]
     return []
 
 
@@ -304,13 +336,18 @@ def main() -> int:
         report = format_report(issues, args.structural_only)
 
         if args.output:
-            pathlib.Path(args.output).write_text(report, encoding="utf-8")
+            atomic_write(args.output, report)
         else:
             today = datetime.date.today().isoformat()
             default_path = ROOT_DIR / "reports" / f"lint-{today}.md"
             default_path.parent.mkdir(parents=True, exist_ok=True)
-            default_path.write_text(report, encoding="utf-8")
+            atomic_write(default_path, report)
             print(report)
+
+        # Update last_lint timestamp in state
+        state = load_state()
+        state["last_lint"] = now_iso()
+        save_state(state)
 
         # Return non-zero if any errors exist
         error_count = sum(

@@ -13,12 +13,19 @@ def _load_config(path: pathlib.Path) -> dict[str, Any]:
 
 
 CONFIG_PATH = pathlib.Path(__file__).resolve().parent.parent / "config.yaml"
-CONFIG = _load_config(CONFIG_PATH)
+_CONFIG: dict[str, Any] | None = None
+
+
+def _get_config() -> dict[str, Any]:
+    global _CONFIG
+    if _CONFIG is None:
+        _CONFIG = _load_config(CONFIG_PATH)
+    return _CONFIG
 
 
 def cfg(path: str, default: Any = None) -> Any:
     """Dot-path config lookup, e.g. cfg('ollama.model')."""
-    node = CONFIG
+    node = _get_config()
     for part in path.split("."):
         if not isinstance(node, dict):
             return default
@@ -31,7 +38,9 @@ def cfg(path: str, default: Any = None) -> Any:
 # Path constants
 ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
 DAILY_DIR = ROOT_DIR / "daily"
-KNOWLEDGE_DIR = pathlib.Path(cfg("plugin.wiki_path", str(ROOT_DIR / "knowledge"))).expanduser()
+_wiki = cfg("plugin.wiki_path", str(ROOT_DIR / "knowledge"))
+KNOWLEDGE_DIR = ROOT_DIR / _wiki if not pathlib.Path(_wiki).is_absolute() else pathlib.Path(_wiki)
+KNOWLEDGE_DIR = KNOWLEDGE_DIR.expanduser().resolve()
 SCRIPTS_DIR = ROOT_DIR / "scripts"
 REPORTS_DIR = ROOT_DIR / "reports"
 STATE_PATH = SCRIPTS_DIR / "state.json"
@@ -49,7 +58,8 @@ def ollama_completion(
     Returns the parsed JSON response. Raises RuntimeError on HTTP or
     parsing failures.
     """
-    base_url = cfg("ollama.base_url", "http://localhost:11434/v1").rstrip("/")
+    base_url = cfg("ollama.base_url", "http://localhost:11434/v1")
+    base_url = base_url.rstrip("/")
     model = cfg("ollama.model", "kimi-k2.6:cloud")
 
     payload: dict[str, Any] = {
@@ -68,12 +78,12 @@ def ollama_completion(
             f"{base_url}/chat/completions",
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=300,
+            timeout=1800,  # 30 minutes — compilation may run for many minutes.
         )
         resp.raise_for_status()
         return resp.json()
     except requests.HTTPError as exc:
         err_body = exc.response.text if exc.response else ""
         raise RuntimeError(f"Ollama HTTP {exc.response.status_code if exc.response else '?'}: {err_body}") from exc
-    except Exception as exc:
+    except requests.RequestException as exc:
         raise RuntimeError(f"Ollama request failed: {exc}") from exc

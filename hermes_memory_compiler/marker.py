@@ -12,7 +12,9 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
+
+from ._common import DEFAULT_MARKER_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +26,7 @@ def _marker_path(session_id: str, marker_dir: Path) -> Path:
     return marker_dir / f"{safe}.json"
 
 
-def read_marker(session_id: str, marker_dir: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+def read_marker(session_id: str, marker_dir: Path | None = None) -> dict[str, Any] | None:
     """Read a marker file for *session_id*.
 
     Args:
@@ -34,68 +36,69 @@ def read_marker(session_id: str, marker_dir: Optional[Path] = None) -> Optional[
             is used.
 
     Returns:
-        The parsed JSON dict, or ``None`` if the marker does not exist
-        or is unreadable.
+        The parsed JSON dict, or ``None`` if the marker does not exist.
+        Raises ``json.JSONDecodeError`` if the file is corrupt.
     """
     if marker_dir is None:
-        marker_dir = Path("~/.hermes/plugins/hermes-memory-compiler/markers").expanduser()
+        marker_dir = DEFAULT_MARKER_DIR
 
     path = _marker_path(session_id, marker_dir)
     if not path.exists():
         return None
 
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        logger.warning("Failed to read marker for %s: %s", session_id, exc)
-        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def write_marker(session_id: str, data: Dict[str, Any], marker_dir: Optional[Path] = None) -> None:
+def write_marker(session_id: str, data: dict[str, Any], marker_dir: Path | None = None) -> None:
     """Atomically write a marker file for *session_id*.
 
     Uses write-to-temp-then-rename to ensure readers never see a
     partially-written file.
     """
     if marker_dir is None:
-        marker_dir = Path("~/.hermes/plugins/hermes-memory-compiler/markers").expanduser()
+        marker_dir = DEFAULT_MARKER_DIR
 
     marker_dir.mkdir(parents=True, exist_ok=True)
     path = _marker_path(session_id, marker_dir)
 
+    fd, tmp = tempfile.mkstemp(dir=str(marker_dir), prefix=".marker_", suffix=".tmp")
+    success = False
     try:
-        fd, tmp = tempfile.mkstemp(dir=str(marker_dir), prefix=".marker_", suffix=".tmp")
-        try:
-            os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
-        finally:
-            os.close(fd)
+        os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
+        os.close(fd)
         os.replace(tmp, path)
-    except Exception as exc:
-        logger.warning("Failed to write marker for %s: %s", session_id, exc)
+        success = True
+    finally:
+        if not success:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
 
 
-def delete_marker(session_id: str, marker_dir: Optional[Path] = None) -> None:
+def delete_marker(session_id: str, marker_dir: Path | None = None) -> None:
     """Delete the marker file for *session_id* if it exists."""
     if marker_dir is None:
-        marker_dir = Path("~/.hermes/plugins/hermes-memory-compiler/markers").expanduser()
+        marker_dir = DEFAULT_MARKER_DIR
 
     path = _marker_path(session_id, marker_dir)
-    try:
-        if path.exists():
-            path.unlink()
-    except Exception as exc:
-        logger.warning("Failed to delete marker for %s: %s", session_id, exc)
+    if path.exists():
+        path.unlink()
 
 
-def list_markers(marker_dir: Optional[Path] = None) -> List[str]:
+def list_markers(marker_dir: Path | None = None) -> list[str]:
     """Return a list of session_ids that currently have marker files."""
     if marker_dir is None:
-        marker_dir = Path("~/.hermes/plugins/hermes-memory-compiler/markers").expanduser()
+        marker_dir = DEFAULT_MARKER_DIR
 
     if not marker_dir.exists():
         return []
 
-    session_ids: List[str] = []
+    session_ids: list[str] = []
     for entry in marker_dir.iterdir():
         if entry.is_file() and entry.suffix == ".json" and not entry.name.startswith("."):
             session_ids.append(entry.stem)

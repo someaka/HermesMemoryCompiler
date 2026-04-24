@@ -17,9 +17,11 @@ import shutil
 import sys
 from pathlib import Path
 
-from config import DAILY_DIR, KNOWLEDGE_DIR, ROOT_DIR, cfg, ollama_completion
-from hermes_plugin.lock import LockHeldError, acquire_lock, release_lock
-from utils import (
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent))
+
+from scripts.config import DAILY_DIR, KNOWLEDGE_DIR, ROOT_DIR, cfg, ollama_completion
+from scripts.utils import (
     file_hash,
     list_raw_files,
     list_wiki_articles,
@@ -27,6 +29,7 @@ from utils import (
     now_iso,
     read_wiki_index,
     save_state,
+    today_iso,
 )
 
 AGENTS_FILE = ROOT_DIR / "AGENTS.md"
@@ -114,7 +117,7 @@ def _tool_read_file(path: str) -> str:
         return f"Error: file not found: {path}"
     try:
         return p.read_text(encoding="utf-8")
-    except Exception as e:
+    except (OSError, PermissionError, UnicodeDecodeError) as e:
         return f"Error reading {path}: {e}"
 
 
@@ -124,7 +127,7 @@ def _tool_write_file(path: str, content: str) -> str:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} chars to {path}"
-    except Exception as e:
+    except (OSError, PermissionError) as e:
         return f"Error writing {path}: {e}"
 
 
@@ -139,7 +142,7 @@ def _tool_edit_file(path: str, old_string: str, new_string: str) -> str:
         text = text.replace(old_string, new_string, 1)
         p.write_text(text, encoding="utf-8")
         return f"Edited {path}"
-    except Exception as e:
+    except (OSError, PermissionError, UnicodeDecodeError) as e:
         return f"Error editing {path}: {e}"
 
 
@@ -164,7 +167,7 @@ def _tool_grep(pattern: str, path: str) -> str:
                         results.append(f"{f}:{i}:{line}")
             except (OSError, PermissionError, UnicodeDecodeError) as e:
                 results.append(f"{f}:Error reading file: {e}")
-    except Exception as e:
+    except (OSError, PermissionError) as e:
         return f"Error during grep: {e}"
     return "\n".join(results[:100]) if results else "(no matches)"
 
@@ -176,15 +179,34 @@ def execute_tool(call: dict) -> str:
     except (KeyError, json.JSONDecodeError) as e:
         return f"Error: malformed tool call: {e}"
     if name == "read_file":
-        return _tool_read_file(args["path"])
+        path = args.get("path")
+        if path is None:
+            return "Error: read_file requires 'path'"
+        return _tool_read_file(path)
     if name == "write_file":
-        return _tool_write_file(args["path"], args["content"])
+        path = args.get("path")
+        content = args.get("content")
+        if path is None or content is None:
+            return "Error: write_file requires 'path' and 'content'"
+        return _tool_write_file(path, content)
     if name == "edit_file":
-        return _tool_edit_file(args["path"], args["old_string"], args["new_string"])
+        path = args.get("path")
+        old_string = args.get("old_string")
+        new_string = args.get("new_string")
+        if path is None or old_string is None or new_string is None:
+            return "Error: edit_file requires 'path', 'old_string', and 'new_string'"
+        return _tool_edit_file(path, old_string, new_string)
     if name == "glob":
-        return _tool_glob(args["pattern"])
+        pattern = args.get("pattern")
+        if pattern is None:
+            return "Error: glob requires 'pattern'"
+        return _tool_glob(pattern)
     if name == "grep":
-        return _tool_grep(args["pattern"], args["path"])
+        pattern = args.get("pattern")
+        path = args.get("path")
+        if pattern is None or path is None:
+            return "Error: grep requires 'pattern' and 'path'"
+        return _tool_grep(pattern, path)
     return f"Unknown tool: {name}"
 
 
@@ -240,7 +262,7 @@ Read the daily log above and compile it into wiki articles following the schema 
    - Use read_file to read the existing article, then edit_file or write_file to update it
    - Add the daily log source to the article's frontmatter
 5. **Update knowledge/index.md** - Add new entries to the table
-   - Each entry: `| [[path/slug]] | One-line summary | source-file | {timestamp[:10]} |`
+   - Each entry: `| [[path/slug]] | One-line summary | source-file | {today_iso()} |`
 6. **Append to knowledge/log.md** - Add a timestamped entry:
    ```
    ## [{timestamp}] compile | {log_path.name}
@@ -283,8 +305,12 @@ Read the daily log above and compile it into wiki articles following the schema 
             print(f"  API error: {e}")
             return
 
-        choice = resp.get("choices", [{}])[0]
-        message = choice.get("message", {})
+        choices = resp.get("choices")
+        if not choices:
+            print("  API error: Ollama returned empty choices")
+            return
+        choice = choices[0]
+        message = choice.get("message") or {}
         content = message.get("content") or ""
         tool_calls = message.get("tool_calls")
 
@@ -312,7 +338,7 @@ Read the daily log above and compile it into wiki articles following the schema 
         return
 
     # Update state
-    rel_path = log_path.name
+    rel_path = f"daily/{log_path.name}"
     state.setdefault("ingested", {})[rel_path] = {
         "hash": file_hash(log_path),
         "compiled_at": now_iso(),
@@ -353,7 +379,7 @@ def main():
             else:
                 to_compile = []
                 for log_path in all_logs:
-                    rel = log_path.name
+                    rel = f"daily/{log_path.name}"
                     prev = state.get("ingested", {}).get(rel, {})
                     if not prev or prev.get("hash") != file_hash(log_path):
                         to_compile.append(log_path)
@@ -372,6 +398,11 @@ def main():
         for i, log_path in enumerate(to_compile, 1):
             print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
             compile_daily_log(log_path, state)
+
+            if f"daily/{log_path.name}" not in state.get("ingested", {}):
+                print(f"  Warning: compilation did not complete for {log_path.name}; skipping archive.")
+                continue
+
             # Archive the daily log after successful compilation
             archive_dir = DAILY_DIR / "archive"
             archive_path = archive_dir / log_path.name

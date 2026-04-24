@@ -8,11 +8,21 @@ dependencies = [
     "requests>=2.28",
 ]
 
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["hermes_memory_compiler"]
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "ruff>=0.4.0",
 ]
+
+[project.entry-points."hermes_agent.plugins"]
+hermes-memory-compiler = "hermes_memory_compiler:register"
 
 [tool.ruff]
 line-length = 100

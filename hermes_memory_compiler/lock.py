@@ -8,7 +8,7 @@ from __future__ import annotations
 import errno
 import json
 import os
-import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -49,15 +49,20 @@ def acquire_lock(wiki_path: Path, agent_name: str, timeout_sec: int = 600) -> di
             existing_ts = data.get("timestamp", "")
             existing_pid = data.get("pid", 0)
 
-            # Check if lock is stale (>10 min old)
+            # Check if lock is stale (>timeout_sec old)
             if existing_ts:
                 try:
-                    lock_time = time.mktime(time.strptime(existing_ts, "%Y-%m-%dT%H:%M:%S"))
-                    if time.time() - lock_time > timeout_sec:
+                    lock_time = datetime.fromisoformat(existing_ts)
+                    now = datetime.now(timezone.utc)
+                    if (now - lock_time).total_seconds() > timeout_sec:
                         # Stale lock — remove it
                         lock_path.unlink()
-                except (ValueError, OSError):
-                    pass
+                except (ValueError, OSError, TypeError):
+                    # Malformed timestamp — treat as stale and remove
+                    try:
+                        lock_path.unlink()
+                    except OSError:
+                        pass
             else:
                 # No timestamp — treat as stale and remove
                 lock_path.unlink()
@@ -65,7 +70,7 @@ def acquire_lock(wiki_path: Path, agent_name: str, timeout_sec: int = 600) -> di
             # If lock still exists after staleness check, it's held
             if lock_path.exists():
                 raise LockHeldError(existing_agent, existing_ts, existing_pid)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, AttributeError):
             # Corrupt lock file — remove it
             try:
                 lock_path.unlink()
@@ -75,7 +80,7 @@ def acquire_lock(wiki_path: Path, agent_name: str, timeout_sec: int = 600) -> di
     # Acquire lock atomically using O_CREAT | O_EXCL
     lock_info = {
         "agent_name": agent_name,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "pid": os.getpid(),
     }
 

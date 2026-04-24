@@ -8,13 +8,20 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import pathlib
 import re
 import sys
+from datetime import timezone
 from typing import Any
 
-from config import KNOWLEDGE_DIR, ROOT_DIR, cfg, ollama_completion
-from utils import atomic_write, extract_wikilinks, list_wiki_articles, read_wiki_index
+from pathlib import Path
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent))
+
+from scripts.config import KNOWLEDGE_DIR, ROOT_DIR, cfg, ollama_completion
+from hermes_memory_compiler.lock import LockHeldError, acquire_lock, release_lock
+from scripts.utils import atomic_write, extract_wikilinks, list_wiki_articles, read_wiki_index
 
 
 def _sanitize_filename(text: str) -> str:
@@ -63,15 +70,20 @@ def _select_articles_via_llm(question: str, index_text: str) -> list[str]:
             temperature=cfg("query.temperature", 0.2),
             max_tokens=cfg("query.max_tokens", 2048),
         )
-        content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-        # Try to extract JSON array
+        content = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        # Try to parse the entire response first; fall back to regex extraction
+        # because some models wrap the JSON in markdown fences or prose.
+        stripped = content.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            paths = json.loads(stripped)
+            if isinstance(paths, list):
+                return [str(p) for p in paths]
         match = re.search(r"\[.*?\]", content, re.DOTALL)
         if match:
-            import json
             paths = json.loads(match.group(0))
             if isinstance(paths, list):
                 return [str(p) for p in paths]
-    except Exception as exc:
+    except (RuntimeError, json.JSONDecodeError, KeyError) as exc:
         raise RuntimeError(f"Article selection failed: {exc}") from exc
     return []
 
@@ -114,49 +126,67 @@ def run_query(question: str, file_back: bool = False) -> str:
         temperature=cfg("query.temperature", 0.2),
         max_tokens=cfg("query.max_tokens", 2048),
     )
-    answer = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+    choices = resp.get("choices")
+    if not choices:
+        return "Error: Ollama returned empty choices."
+    answer = choices[0].get("message", {}).get("content", "")
 
     if file_back:
-        today = datetime.date.today().isoformat()
-        slug = _sanitize_filename(question)
-        filename = f"{today}-{slug}.md"
-        qa_path = KNOWLEDGE_DIR / "qa" / filename
-        frontmatter = (
-            f"---\n"
-            f"title: \"Q: {question}\"\n"
-            f"question: \"{question}\"\n"
-            f"consulted:\n"
-            + "".join(f"  - \"{c}\"\n" for c in consulted)
-            + f"filed: {today}\n"
-            "---\n\n"
-        )
-        content = frontmatter + f"# Q: {question}\n\n## Answer\n\n{answer}\n\n## Sources Consulted\n\n"
-        for c in consulted:
-            content += f"- [[{c}]]\n"
-        atomic_write(qa_path, content)
-        print(f"Filed answer to: {qa_path.relative_to(ROOT_DIR)}")
+        try:
+            acquire_lock(KNOWLEDGE_DIR, "hermes")
+        except LockHeldError as exc:
+            print(
+                f"Warning: could not file back answer — lock held by {exc.agent_name} "
+                f"since {exc.timestamp} (pid {exc.pid})",
+                file=sys.stderr,
+            )
+            return answer
 
-        # Update knowledge/index.md
-        index_path = KNOWLEDGE_DIR / "index.md"
-        index_text = index_path.read_text(encoding="utf-8") if index_path.exists() else ""
-        row = f"| [[qa/{today}-{slug}]] | Answer to: {question} | query | {today} |"
-        if not index_text.endswith("\n"):
-            index_text += "\n"
-        index_text += row + "\n"
-        atomic_write(index_path, index_text)
+        try:
+            today = datetime.date.today().isoformat()
+            slug = _sanitize_filename(question)
+            filename = f"{today}-{slug}.md"
+            qa_path = KNOWLEDGE_DIR / "qa" / filename
+            frontmatter = (
+                f"---\n"
+                f"title: \"Q: {question}\"\n"
+                f"question: \"{question}\"\n"
+                f"consulted:\n"
+                + "".join(f"  - \"{c}\"\n" for c in consulted)
+                + f"filed: {today}\n"
+                "---\n\n"
+            )
+            content = frontmatter + f"# Q: {question}\n\n## Answer\n\n{answer}\n\n## Sources Consulted\n\n"
+            for c in consulted:
+                content += f"- [[{c}]]\n"
+            atomic_write(qa_path, content)
+            print(f"Filed answer to: {qa_path.relative_to(ROOT_DIR)}")
 
-        # Update knowledge/log.md
-        log_path = KNOWLEDGE_DIR / "log.md"
-        log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
-        timestamp = datetime.datetime.now().isoformat()
-        log_entry = f"## [{timestamp}] query | \"{question}\"\n"
-        if consulted:
-            log_entry += "- Consulted: " + ", ".join(f"[[{c}]]" for c in consulted) + "\n"
-        log_entry += f"- Filed to: [[qa/{today}-{slug}]]\n"
-        if not log_text.endswith("\n"):
-            log_text += "\n"
-        log_text += log_entry + "\n"
-        atomic_write(log_path, log_text)
+            # Update knowledge/index.md
+            index_path = KNOWLEDGE_DIR / "index.md"
+            index_text = index_path.read_text(encoding="utf-8") if index_path.exists() else ""
+            # Escape pipe characters in the question to avoid breaking the markdown table.
+            safe_question = question.replace("|", "\\|")
+            row = f"| [[qa/{today}-{slug}]] | Answer to: {safe_question} | query | {today} |"
+            if not index_text.endswith("\n"):
+                index_text += "\n"
+            index_text += row + "\n"
+            atomic_write(index_path, index_text)
+
+            # Update knowledge/log.md
+            log_path = KNOWLEDGE_DIR / "log.md"
+            log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+            timestamp = datetime.datetime.now(timezone.utc).isoformat()
+            log_entry = f"## [{timestamp}] query | \"{question}\"\n"
+            if consulted:
+                log_entry += "- Consulted: " + ", ".join(f"[[{c}]]" for c in consulted) + "\n"
+            log_entry += f"- Filed to: [[qa/{today}-{slug}]]\n"
+            if not log_text.endswith("\n"):
+                log_text += "\n"
+            log_text += log_entry + "\n"
+            atomic_write(log_path, log_text)
+        finally:
+            release_lock(KNOWLEDGE_DIR)
 
     return answer
 

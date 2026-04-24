@@ -18,29 +18,21 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
-import requests
 
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent))
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+from scripts.config import KNOWLEDGE_DIR, ROOT_DIR, cfg, ollama_completion
+from hermes_memory_compiler.lock import LockHeldError, acquire_lock, release_lock
+from scripts.utils import atomic_json_write, hash_file
+
 SCRIPTS_DIR = ROOT_DIR / "scripts"
-DEFAULT_CONFIG: dict[str, Any] = {
-    "ollama": {
-        "base_url": "http://localhost:11434/v1",
-        "model": "kimi-k2.6:cloud",
-    },
-    "flush": {
-        "temperature": 0.2,
-        "max_tokens": 2048,
-        "min_turns_before_flush": 3,
-        "max_messages_per_flush": 50,
-    },
-    "plugin": {
-        "auto_compile_hour": 18,
-    },
-}
+
+# Minimum seconds between flushes of the same session to prevent dupes.
+DEDUP_WINDOW_SECONDS = 60
 
 FLUSH_PROMPT = """\
 Review the conversation context below and respond with a concise summary
@@ -66,25 +58,6 @@ If nothing worth saving: respond with exactly FLUSH_OK.
 """
 
 
-def get_config() -> dict[str, Any]:
-    """Load config.yaml from project root, falling back to hard-coded defaults."""
-    import yaml
-    config_path = ROOT_DIR / "config.yaml"
-    config = {k: dict(v) for k, v in DEFAULT_CONFIG.items()}
-    if config_path.exists():
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                loaded = yaml.safe_load(f)
-            if isinstance(loaded, dict):
-                for section in ("ollama", "flush", "compiler", "query", "lint", "plugin"):
-                    if section in loaded and isinstance(loaded[section], dict):
-                        config.setdefault(section, {})
-                        config[section].update(loaded[section])
-        except Exception as e:
-            print(f"Warning: could not read config.yaml: {e}", file=sys.stderr)
-    return config
-
-
 def atomic_append(filepath: Path, content: str) -> None:
     """Atomically append content to a file using write-to-temp-then-rename."""
     filepath.parent.mkdir(parents=True, exist_ok=True)
@@ -98,72 +71,26 @@ def atomic_append(filepath: Path, content: str) -> None:
         os.replace(tmp_path, filepath)
     except Exception:
         try:
-            os.close(fd)
-        except OSError:
-            pass
-        if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
         raise
 
 
-def atomic_json_write(path: Path, data: object) -> None:
-    """Serialize data as JSON and write atomically."""
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.write("\n")
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise
-
-
-def hash_file(path: Path) -> str:
-    """Return the SHA-256 hex digest of a file's contents."""
-    import hashlib
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def call_ollama(prompt: str, config: dict[str, Any], dry_run: bool = False) -> Optional[str]:
+def _call_ollama(prompt: str, dry_run: bool = False) -> Optional[str]:
     """Send a chat-completion request to the Ollama API."""
     if dry_run:
         return "FLUSH_OK"
 
-    base_url = str(config["ollama"].get("base_url", "http://localhost:11434/v1")).rstrip("/")
-    model = str(config["ollama"].get("model", "kimi-k2.6:cloud"))
-    temperature = float(config["flush"].get("temperature", 0.2))
-    max_tokens = int(config["flush"].get("max_tokens", 2048))
-
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-
-    try:
-        resp = requests.post(
-            f"{base_url}/chat/completions",
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"Error calling Ollama: {e}", file=sys.stderr)
-        return None
+    resp = ollama_completion(
+        messages=[{"role": "user", "content": prompt}],
+        temperature=float(cfg("flush.temperature", 0.2)),
+        max_tokens=int(cfg("flush.max_tokens", 2048)),
+    )
+    choices = resp.get("choices")
+    if not choices:
+        raise RuntimeError("Ollama response missing choices")
+    return choices[0].get("message", {}).get("content", "")
 
 
 def format_messages(messages: list[dict[str, Any]]) -> str:
@@ -184,6 +111,21 @@ def format_messages(messages: list[dict[str, Any]]) -> str:
     return "\n\n".join(lines)
 
 
+def _format_metadata(session_data: dict[str, Any]) -> str:
+    """Extract session top-level metadata and format as markdown."""
+    lines: list[str] = []
+    model = session_data.get("model")
+    platform = session_data.get("platform")
+    session_start = session_data.get("session_start")
+    if model:
+        lines.append(f"**Model:** {model}")
+    if platform:
+        lines.append(f"**Platform:** {platform}")
+    if session_start:
+        lines.append(f"**Session Start:** {session_start}")
+    return "\n".join(lines)
+
+
 def _should_skip_dedup(session_id: str) -> bool:
     """Read scripts/last-flush.json and skip if same session was flushed within 60 seconds."""
     last_flush_path = SCRIPTS_DIR / "last-flush.json"
@@ -196,10 +138,10 @@ def _should_skip_dedup(session_id: str) -> bool:
         last_ts = sessions.get(session_id, "")
         if last_ts:
             last_dt = datetime.fromisoformat(last_ts)
-            delta = (datetime.now() - last_dt).total_seconds()
-            if delta < 60:
+            delta = (datetime.now(timezone.utc) - last_dt).total_seconds()
+            if delta < DEDUP_WINDOW_SECONDS:
                 return True
-    except (json.JSONDecodeError, OSError, KeyError) as e:
+    except (json.JSONDecodeError, OSError) as e:
         print(f"Warning: could not read last-flush.json: {e}", file=sys.stderr)
     return False
 
@@ -216,48 +158,57 @@ def _write_last_flush(session_id: str) -> None:
             print(f"Warning: could not read last-flush.json: {e}", file=sys.stderr)
     if "sessions" not in data or not isinstance(data.get("sessions"), dict):
         data["sessions"] = {}
-    data["sessions"][session_id] = datetime.now().isoformat()
+    data["sessions"][session_id] = datetime.now(timezone.utc).isoformat()
     atomic_json_write(last_flush_path, data)
 
 
-def _maybe_trigger_compile(daily_path: Path, config: dict[str, Any]) -> None:
+def _maybe_trigger_compile(daily_path: Path) -> None:
     """After a successful flush, auto-trigger compile.py if conditions are met."""
-    auto_hour = int(config.get("plugin", {}).get("auto_compile_hour", 18))
-    if datetime.now().hour < auto_hour:
+    auto_hour = int(cfg("plugin.auto_compile_hour", 18))
+    if datetime.now(timezone.utc).hour < auto_hour:
         return
 
-    current_hash = ""
-    if daily_path.exists():
-        current_hash = hash_file(daily_path)
+    try:
+        acquire_lock(KNOWLEDGE_DIR, "hermes-flush")
+    except LockHeldError:
+        print("Compilation lock held; skipping auto-compile.", file=sys.stderr)
+        return
 
-    state_path = SCRIPTS_DIR / "state.json"
-    state: dict[str, Any] = {}
-    if state_path.exists():
-        try:
-            with open(state_path, "r", encoding="utf-8") as f:
-                state = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"Warning: could not read state.json: {e}", file=sys.stderr)
+    try:
+        current_hash = ""
+        if daily_path.exists():
+            current_hash = hash_file(daily_path)
 
-    last_hash = state.get("last_compile_hash", "")
+        state_path = SCRIPTS_DIR / "state.json"
+        state: dict[str, Any] = {}
+        if state_path.exists():
+            try:
+                with open(state_path, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"Warning: could not read state.json: {e}", file=sys.stderr)
 
-    if current_hash != last_hash:
-        print(f"Auto-compiling (hour >= {auto_hour} and daily log changed)...")
-        result = subprocess.run(
-            [sys.executable, str(SCRIPTS_DIR / "compile.py")],
-            cwd=str(ROOT_DIR),
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            state["last_compile_hash"] = current_hash
-            atomic_json_write(state_path, state)
-            print("Auto-compile completed.")
-        else:
-            print(f"Auto-compile failed: {result.stderr}", file=sys.stderr)
+        last_hash = state.get("last_compile_hash", "")
+
+        if current_hash != last_hash:
+            print(f"Auto-compiling (hour >= {auto_hour} and daily log changed)...")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "compile.py")],
+                cwd=str(ROOT_DIR),
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                state["last_compile_hash"] = current_hash
+                atomic_json_write(state_path, state)
+                print("Auto-compile completed.")
+            else:
+                print(f"Auto-compile failed: {result.stderr}", file=sys.stderr)
+    finally:
+        release_lock(KNOWLEDGE_DIR)
 
 
-def flush_session(session_id: str, config: dict[str, Any], dry_run: bool = False) -> Optional[str]:
+def flush_session(session_id: str, dry_run: bool = False) -> Optional[str]:
     """
     Flush a single session.
 
@@ -265,11 +216,13 @@ def flush_session(session_id: str, config: dict[str, Any], dry_run: bool = False
     None if nothing was flushed or FLUSH_OK was returned.
     """
     if _should_skip_dedup(session_id):
-        print(f"Skipping {session_id}: flushed within last 60 seconds.")
+        print(f"Skipping {session_id}: flushed within last {DEDUP_WINDOW_SECONDS} seconds.")
         return None
 
     sessions_dir = Path.home() / ".hermes" / "sessions"
-    marker_dir = Path.home() / ".hermes" / "plugins" / "hermes-memory-compiler" / "markers"
+    marker_dir = Path(
+        cfg("plugin.marker_dir", str(Path.home() / ".hermes" / "plugins" / "hermes-memory-compiler" / "markers"))
+    ).expanduser()
     daily_dir = ROOT_DIR / "daily"
 
     session_path = sessions_dir / f"session_{session_id}.json"
@@ -288,13 +241,9 @@ def flush_session(session_id: str, config: dict[str, Any], dry_run: bool = False
 
     messages = session_data.get("messages", [])
     if not isinstance(messages, list):
-        print(f"Invalid messages in session {session_id}", file=sys.stderr)
-        return None
+        raise ValueError(f"Invalid messages in session {session_id}: expected list, got {type(messages).__name__}")
 
-    total_count = session_data.get("message_count", len(messages))
-    if total_count != len(messages):
-        total_count = len(messages)
-
+    total_count = len(messages)
     marker_count = 0
     flush_count = 0
     if marker_path.exists():
@@ -316,27 +265,26 @@ def flush_session(session_id: str, config: dict[str, Any], dry_run: bool = False
     # Filter to user/assistant roles only
     filtered = [m for m in delta if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
 
-    min_turns = int(config["flush"].get("min_turns_before_flush", 3))
+    min_turns = int(cfg("flush.min_turns_before_flush", 3))
     if len(filtered) < min_turns:
         return None
 
-    max_msgs = int(config["flush"].get("max_messages_per_flush", 50))
+    max_msgs = int(cfg("flush.max_messages_per_flush", 50))
     filtered = filtered[:max_msgs]
 
+    metadata_text = _format_metadata(session_data)
     context = format_messages(filtered)
+    if metadata_text:
+        context = metadata_text + "\n\n" + context
     if not context.strip():
         return None
 
     prompt = FLUSH_PROMPT.format(context=context)
-    response = call_ollama(prompt, config, dry_run=dry_run)
-
-    if response is None:
-        print(f"Ollama call failed for session {session_id}; marker not updated.", file=sys.stderr)
-        return None
+    response = _call_ollama(prompt, dry_run=dry_run)
 
     stripped = response.strip()
 
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
 
     marker_data = {
         "message_count": total_count,
@@ -364,11 +312,11 @@ def flush_session(session_id: str, config: dict[str, Any], dry_run: bool = False
 """
 
     if not dry_run:
-        atomic_append(daily_path, entry)
         marker_dir.mkdir(parents=True, exist_ok=True)
         atomic_json_write(marker_path, marker_data)
         _write_last_flush(session_id)
-        _maybe_trigger_compile(daily_path, config)
+        atomic_append(daily_path, entry)
+        _maybe_trigger_compile(daily_path)
     else:
         print(f"[DRY-RUN] Would append to {daily_path}")
         print(entry)
@@ -376,7 +324,7 @@ def flush_session(session_id: str, config: dict[str, Any], dry_run: bool = False
     return session_id
 
 
-def flush_all(config: dict[str, Any], dry_run: bool = False) -> list[str]:
+def flush_all(dry_run: bool = False) -> list[str]:
     """
     Scan all session files and flush any with new messages.
 
@@ -391,7 +339,7 @@ def flush_all(config: dict[str, Any], dry_run: bool = False) -> list[str]:
 
     for session_file in sorted(sessions_dir.glob("session_*.json")):
         session_id = session_file.stem.replace("session_", "")
-        result = flush_session(session_id, config, dry_run=dry_run)
+        result = flush_session(session_id, dry_run=dry_run)
         if result:
             flushed.append(result)
 
@@ -405,10 +353,8 @@ def main() -> int:
     parser.add_argument("--all", action="store_true", help="Flush all sessions with new content")
     args = parser.parse_args()
 
-    config = get_config()
-
     if args.session:
-        result = flush_session(args.session, config, dry_run=args.dry_run)
+        result = flush_session(args.session, dry_run=args.dry_run)
         if result:
             print(f"Flushed session: {result}")
         else:
@@ -417,7 +363,7 @@ def main() -> int:
 
     # Default to --all if --dry-run is given without a specific session
     if args.all or args.dry_run:
-        flushed = flush_all(config, dry_run=args.dry_run)
+        flushed = flush_all(dry_run=args.dry_run)
         print(f"Flushed {len(flushed)} session(s): {', '.join(flushed) if flushed else 'none'}")
         return 0
 

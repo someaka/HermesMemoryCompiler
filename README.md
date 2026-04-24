@@ -9,18 +9,16 @@ The Memory Compiler treats your daily conversation logs as **source code** and u
 - `daily/` → raw conversation logs (append-only)
 - `knowledge/` → compiled articles, connections, and Q&A
 - `scripts/` → compiler, linter, query engine, and flush daemon
-- `hermes_plugin/` → Hermes CLI plugin for lifecycle hooks and commands
+- `hermes_memory_compiler/` → Hermes CLI plugin for lifecycle hooks and commands
 
 ## Installation
 
 1. Clone or copy this repository to your machine.
-2. Install the Hermes plugin:
+2. Install the Hermes plugin via symlink:
 
 ```bash
 cd /path/to/hermes-memory-compiler
-hermes plugins install .
-# or create a symlink manually:
-ln -s $(pwd)/hermes_plugin ~/.hermes/plugins/hermes-memory-compiler
+ln -s $(pwd)/hermes_memory_compiler ~/.hermes/plugins/hermes-memory-compiler
 ```
 
 3. Enable the plugin:
@@ -42,7 +40,22 @@ flush:
   max_tokens: 2048
   min_turns_before_flush: 3
   max_messages_per_flush: 50
+compiler:
+  temperature: 0.3
+  max_tokens: 4096
+  max_turns: 30
+query:
+  temperature: 0.2
+  max_tokens: 2048
+lint:
+  structural_only: false
+plugin:
+  auto_flush: true
   auto_compile_hour: 18
+  wiki_path: "knowledge"
+  marker_dir: "~/.hermes/plugins/hermes-memory-compiler/markers"
+  max_context_chars: 20000
+  max_log_lines: 30
 ```
 
 Adjust the Ollama URL and model to match your local setup.
@@ -89,15 +102,19 @@ hermes kb flush
 hermes kb status
 ```
 
-### In-session slash command
+### In-session slash commands
 
-While chatting with Hermes, you can query the knowledge base directly:
+While chatting with Hermes, you can run knowledge-base operations directly:
 
 ```
 /kbq How do I handle auth redirects?
+/mcompile --dry-run
+/mlint --structural-only
+/mquery --file-back How do I handle auth redirects?
 ```
 
-This runs the same query engine as `hermes kb query` and returns the answer inline.
+`/kbq` runs the same query engine as `hermes kb query` and returns the answer inline.
+`/mcompile`, `/mlint`, and `/mquery` mirror their CLI counterparts.
 
 ## Directory Structure
 
@@ -119,9 +136,10 @@ This runs the same query engine as `hermes kb query` and returns the answer inli
 │   ├── utils.py            # Shared helpers
 │   ├── state.json          # Compilation tracking (gitignored)
 │   └── install-cron.sh     # Cron helper
-├── hermes_plugin/          # Hermes plugin package
+├── hermes_memory_compiler/          # Hermes plugin package
 │   ├── __init__.py         # CLI & slash command registration
 │   ├── hooks.py            # Lifecycle hooks
+│   ├── lock.py             # Cross-agent compilation lock
 │   └── marker.py           # Session marker I/O
 ├── config.yaml             # User configuration
 └── pyproject.toml          # Python dependencies

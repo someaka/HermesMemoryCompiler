@@ -281,7 +281,7 @@ Output: a markdown report with severity levels (error, warning, suggestion).
 
 ## Hermes Plugin System
 
-The `hermes_plugin/` package integrates the Memory Compiler with the Hermes CLI.
+The `hermes_memory_compiler/` package integrates the Memory Compiler with the Hermes CLI.
 
 ### Hook Lifecycle
 
@@ -311,7 +311,7 @@ To disable: set `plugin.auto_flush: false` in `config.yaml`.
 
 ### CLI Commands
 
-Registered via `hermes_plugin/__init__.py`:
+Registered via `hermes_memory_compiler/__init__.py`:
 
 | Command | Action |
 |---------|--------|

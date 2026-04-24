@@ -13,90 +13,76 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from . import marker
+from ._common import DEFAULT_MARKER_DIR, resolve_project_root
 
 logger = logging.getLogger(__name__)
 
-def _resolve_project_root() -> Path:
-    """Locate project root by finding config.yaml relative to this file."""
-    current = Path(__file__).resolve().parent
-    for _ in range(3):
-        if (current / "config.yaml").exists():
-            return current
-        current = current.parent
-    raise RuntimeError("Could not find project root (config.yaml not found)")
-
-_PROJECT_ROOT = _resolve_project_root()
+_PROJECT_ROOT = resolve_project_root()
 _CONFIG_PATH = _PROJECT_ROOT / "config.yaml"
-_DEFAULT_MARKER_DIR = Path("~/.hermes/plugins/hermes-memory-compiler/markers").expanduser()
+
+def _load_config() -> dict[str, Any]:
+    """Load the Memory Compiler config from config.yaml.
+
+    Raises:
+        FileNotFoundError: If config.yaml does not exist.
+        yaml.YAMLError: If the file contains invalid YAML.
+        OSError: If the file cannot be read.
+    """
+    import yaml
+
+    if not _CONFIG_PATH.exists():
+        raise FileNotFoundError(f"Memory Compiler config not found: {_CONFIG_PATH}")
+    with _CONFIG_PATH.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 
-def _load_config() -> Dict[str, Any]:
-    """Load the Memory Compiler config, returning an empty dict on failure."""
-    try:
-        import yaml
-        if _CONFIG_PATH.exists():
-            return yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf-8")) or {}
-    except Exception as exc:
-        logger.debug("Failed to load config from %s: %s", _CONFIG_PATH, exc)
-    return {}
-
-
-def _get_plugin_config() -> Dict[str, Any]:
+def _get_plugin_config() -> dict[str, Any]:
     """Return the ``plugin`` section of the config with sensible defaults."""
     cfg = _load_config()
     plugin_cfg = cfg.get("plugin", {})
     return {
         "wiki_path": Path(plugin_cfg.get("wiki_path", str(_PROJECT_ROOT / "knowledge"))).expanduser(),
-        "marker_dir": Path(plugin_cfg.get("marker_dir", str(_DEFAULT_MARKER_DIR))).expanduser(),
+        "marker_dir": Path(plugin_cfg.get("marker_dir", str(DEFAULT_MARKER_DIR))).expanduser(),
         "max_context_chars": int(plugin_cfg.get("max_context_chars", 20000)),
         "max_log_lines": int(plugin_cfg.get("max_log_lines", 30)),
         "auto_flush": bool(plugin_cfg.get("auto_flush", True)),
     }
 
-def _flush_session(session_id: str, cfg: Dict[str, Any]) -> None:
+def _flush_session(session_id: str, cfg: dict[str, Any]) -> None:
     """Run flush.py for a single session via subprocess.
 
     Uses HERMES_FLUSH_IN_PROGRESS env var as recursion guard.
+    Raises on failure so the caller can decide whether to delete the marker.
     """
-    if os.environ.get("HERMES_FLUSH_IN_PROGRESS"):
+    if os.environ.get("HERMES_FLUSH_IN_PROGRESS") == "1":
         logger.debug("Flush already in progress, skipping")
         return
 
     env = os.environ.copy()
     env["HERMES_FLUSH_IN_PROGRESS"] = "1"
 
-    try:
-        result = subprocess.run(
-            [sys.executable, str(_PROJECT_ROOT / "scripts" / "flush.py"), "--session", session_id],
-            cwd=_PROJECT_ROOT,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            logger.error("Flush failed for session %s: %s", session_id, result.stderr)
-        else:
-            logger.info("Flushed session %s", session_id)
-    except subprocess.TimeoutExpired:
-        logger.error("Flush timed out for session %s", session_id)
-    except Exception as exc:
-        logger.error("Flush exception for session %s: %s", session_id, exc)
+    result = subprocess.run(
+        [sys.executable, str(_PROJECT_ROOT / "scripts" / "flush.py"), "--session", session_id],
+        cwd=_PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Flush failed for session {session_id}: {result.stderr}")
+    logger.info("Flushed session %s", session_id)
 
 
 
-def _read_file_lines(path: Path, max_lines: Optional[int] = None) -> str:
+def _read_file_lines(path: Path, max_lines: int | None = None) -> str:
     """Read a text file, optionally keeping only the last *max_lines* lines."""
     if not path.exists():
         return ""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except Exception as exc:
-        logger.debug("Failed to read %s: %s", path, exc)
-        return ""
+    text = path.read_text(encoding="utf-8")
 
     if max_lines is None or max_lines <= 0:
         return text
@@ -113,15 +99,67 @@ def _today_log_path() -> Path:
     return _PROJECT_ROOT / "daily" / f"{today}.md"
 
 
+def on_session_start(
+    session_id: str,
+    model: str,
+    platform: str,
+    **kwargs: Any,
+) -> None:
+    """Log session start and initialize tracking.
+
+    Args:
+        session_id: The unique session identifier.
+        model: The LLM model name for this session.
+        platform: The messaging platform (e.g., cli, telegram).
+    """
+    logger.debug("Session start: %s (model=%s, platform=%s)", session_id, model, platform)
+
+
+def on_session_end(
+    session_id: str,
+    completed: bool,
+    interrupted: bool,
+    model: str,
+    platform: str,
+    **kwargs: Any,
+) -> None:
+    """Log session end.
+
+    Note: Final flush and marker cleanup are handled by ``on_session_finalize``
+    to avoid double-flushing.
+    """
+    logger.debug(
+        "Session end: %s (completed=%s, interrupted=%s)",
+        session_id, completed, interrupted,
+    )
+
+
+def on_session_reset(
+    session_id: str,
+    **kwargs: Any,
+) -> None:
+    """Clean up the session marker when the user explicitly resets the session.
+
+    This prevents stale markers from carrying over to the next session
+    when the session ID is reused.
+    """
+    if not session_id:
+        raise ValueError("session_id is required for on_session_reset")
+    cfg = _get_plugin_config()
+    marker_dir = cfg["marker_dir"]
+    marker.delete_marker(session_id, marker_dir=marker_dir)
+    logger.debug("Session reset: %s", session_id)
+
+
 def on_pre_llm_call(
     session_id: str,
     user_message: str,
-    conversation_history: List[Dict[str, Any]],
+    conversation_history: list[dict[str, Any]],
     is_first_turn: bool,
     model: str,
     platform: str,
     **kwargs: Any,
-) -> Optional[Dict[str, str]]:
+) -> dict[str, str] | None:
     """Inject KB context into the user message on the first turn only.
 
     Reads ``wiki_path/index.md`` and today's daily log (last N lines),
@@ -137,7 +175,7 @@ def on_pre_llm_call(
     max_context_chars = cfg["max_context_chars"]
     max_log_lines = cfg["max_log_lines"]
 
-    parts: List[str] = []
+    parts: list[str] = []
 
     # 1. Index / table of contents
     index_path = wiki_path / "index.md"
@@ -159,7 +197,7 @@ def on_pre_llm_call(
         context = context[:max_context_chars]
         # Try to cut at a newline boundary for cleanliness.
         last_nl = context.rfind("\n")
-        if last_nl > max_context_chars * 0.8:
+        if last_nl > max_context_chars * 8 // 10:
             context = context[:last_nl]
         context = context + "\n\n[Context truncated]"
 
@@ -170,7 +208,7 @@ def on_post_llm_call(
     session_id: str,
     user_message: str,
     assistant_response: str,
-    conversation_history: List[Dict[str, Any]],
+    conversation_history: list[dict[str, Any]],
     model: str,
     platform: str,
     **kwargs: Any,
@@ -187,16 +225,24 @@ def on_post_llm_call(
     cfg = _get_plugin_config()
     marker_dir = cfg["marker_dir"]
 
-    data = {
-        "message_count": len(conversation_history),
-        "last_flush_timestamp": datetime.now(timezone.utc).isoformat(),
-        "flush_count": 0,
-    }
+    existing = marker.read_marker(session_id, marker_dir=marker_dir)
+    if existing is None:
+        data = {
+            "message_count": 0,
+            "last_flush_timestamp": datetime.now(timezone.utc).isoformat(),
+            "flush_count": 0,
+        }
+    else:
+        data = {
+            "message_count": existing.get("message_count", 0),
+            "last_flush_timestamp": datetime.now(timezone.utc).isoformat(),
+            "flush_count": existing.get("flush_count", 0),
+        }
     marker.write_marker(session_id, data, marker_dir=marker_dir)
 
 
 def on_session_finalize(
-    session_id: Optional[str],
+    session_id: str | None,
     platform: str,
     **kwargs: Any,
 ) -> None:
@@ -218,8 +264,8 @@ def on_session_finalize(
 
     # Check if there are messages to flush
     marker_data = marker.read_marker(session_id, marker_dir=marker_dir)
-    if marker_data and marker_data.get("message_count", 0) > 0:
-        _flush_session(session_id, cfg)
-
-    # Clean up marker regardless of flush success/failure
-    marker.delete_marker(session_id, marker_dir=marker_dir)
+    try:
+        if marker_data and marker_data.get("message_count", 0) > 0:
+            _flush_session(session_id, cfg)
+    finally:
+        marker.delete_marker(session_id, marker_dir=marker_dir)

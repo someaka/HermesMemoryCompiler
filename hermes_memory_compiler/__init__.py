@@ -17,21 +17,11 @@ from pathlib import Path
 from typing import Optional
 
 from . import hooks
+from ._common import resolve_project_root
 
 logger = logging.getLogger(__name__)
 
-
-def _resolve_project_root() -> Path:
-    """Locate project root by finding config.yaml relative to this file."""
-    current = Path(__file__).resolve().parent
-    for _ in range(3):
-        if (current / "config.yaml").exists():
-            return current
-        current = current.parent
-    raise RuntimeError("Could not find project root (config.yaml not found)")
-
-
-ROOT_DIR = _resolve_project_root()
+ROOT_DIR = resolve_project_root()
 
 
 # ---------------------------------------------------------------------------
@@ -136,17 +126,22 @@ def _kbq_handler(raw_args: str) -> Optional[str]:
 
 def _mcompile_handler(raw_args: str) -> Optional[str]:
     """Handle ``/mcompile [--all|--file <path>|--dry-run]`` in-session slash command."""
-    args = shlex.split(raw_args.strip()) if raw_args.strip() else []
+    parser = argparse.ArgumentParser(prog="/mcompile", add_help=False)
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--file", type=str, default=None)
+    try:
+        args = parser.parse_args(shlex.split(raw_args.strip()) if raw_args.strip() else [])
+    except SystemExit:
+        return "Usage: /mcompile [--all|--dry-run|--file <path>]"
+
     cmd = [sys.executable, "scripts/compile.py"]
-
-    if "--all" in args:
+    if args.all:
         cmd.append("--all")
-    elif "--dry-run" in args:
+    if args.dry_run:
         cmd.append("--dry-run")
-
-    for i, arg in enumerate(args):
-        if arg == "--file" and i + 1 < len(args):
-            cmd.extend(["--file", args[i + 1]])
+    if args.file:
+        cmd.extend(["--file", args.file])
 
     result = subprocess.run(cmd, cwd=ROOT_DIR, capture_output=True, text=True)
     output = result.stdout.strip()
@@ -157,10 +152,15 @@ def _mcompile_handler(raw_args: str) -> Optional[str]:
 
 def _mlint_handler(raw_args: str) -> Optional[str]:
     """Handle ``/mlint [--structural-only]`` in-session slash command."""
-    args = shlex.split(raw_args.strip()) if raw_args.strip() else []
-    cmd = [sys.executable, "scripts/lint.py"]
+    parser = argparse.ArgumentParser(prog="/mlint", add_help=False)
+    parser.add_argument("--structural-only", action="store_true")
+    try:
+        args = parser.parse_args(shlex.split(raw_args.strip()) if raw_args.strip() else [])
+    except SystemExit:
+        return "Usage: /mlint [--structural-only]"
 
-    if "--structural-only" in args:
+    cmd = [sys.executable, "scripts/lint.py"]
+    if args.structural_only:
         cmd.append("--structural-only")
 
     result = subprocess.run(cmd, cwd=ROOT_DIR, capture_output=True, text=True)
@@ -172,17 +172,19 @@ def _mlint_handler(raw_args: str) -> Optional[str]:
 
 def _mquery_handler(raw_args: str) -> Optional[str]:
     """Handle ``/mquery [--file-back] <question>`` in-session slash command."""
-    args = shlex.split(raw_args.strip()) if raw_args.strip() else []
-    if not args:
+    parser = argparse.ArgumentParser(prog="/mquery", add_help=False)
+    parser.add_argument("--file-back", action="store_true")
+    parser.add_argument("question", nargs="*")
+    try:
+        args = parser.parse_args(shlex.split(raw_args.strip()) if raw_args.strip() else [])
+    except SystemExit:
         return "Usage: /mquery [--file-back] <question>"
 
-    file_back = "--file-back" in args
-    filtered = [a for a in args if a != "--file-back"]
-    if not filtered:
+    if not args.question:
         return "Usage: /mquery [--file-back] <question>"
 
-    cmd = [sys.executable, "scripts/query.py"] + filtered
-    if file_back:
+    cmd = [sys.executable, "scripts/query.py"] + args.question
+    if args.file_back:
         cmd.append("--file-back")
 
     result = subprocess.run(cmd, cwd=ROOT_DIR, capture_output=True, text=True)
@@ -214,6 +216,9 @@ def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", hooks.on_pre_llm_call)
     ctx.register_hook("post_llm_call", hooks.on_post_llm_call)
     ctx.register_hook("on_session_finalize", hooks.on_session_finalize)
+    ctx.register_hook("on_session_start", hooks.on_session_start)
+    ctx.register_hook("on_session_end", hooks.on_session_end)
+    ctx.register_hook("on_session_reset", hooks.on_session_reset)
 
     ctx.register_cli_command(
         name="kb",
