@@ -1,6 +1,22 @@
 # Hermes Memory Compiler
 
+For full technical reference, see [AGENTS.md](AGENTS.md).
+
 A personal knowledge base that compiles your AI conversations into a structured, queryable archive. Instead of manually organizing notes, you talk to the LLM and it extracts concepts, connections, and lessons automatically.
+
+## The Compiler Analogy
+
+```
+Conversation → Hooks (on_post_llm_call) → flush.py → daily/ → compile.py → knowledge/ → on_pre_llm_call → Next Session
+```
+
+- `daily/` = source code (your raw conversations — append-only, never edited)
+- LLM = compiler (extracts, organizes, and cross-references knowledge)
+- `knowledge/` = executable (structured, queryable articles, connections, and Q&A)
+- lint = test suite (health checks for broken links, orphans, contradictions)
+- queries = runtime (the knowledge base answering questions in real time)
+
+> **Unified KB:** The knowledge base at `knowledge/` (or wherever `wiki_path` points in `config.yaml`) is shared between Hermes and Claude Code. Articles are tagged by source (`[Hermes]` or `[ClaudeCode]`). A compilation lock file (`.compile.lock`) prevents concurrent writes.
 
 ## What is this?
 
@@ -13,19 +29,33 @@ The Memory Compiler treats your daily conversation logs as **source code** and u
 
 ## Installation
 
-1. Clone or copy this repository to your machine.
-2. Install the Hermes plugin via symlink:
+1. Clone the repository:
 
 ```bash
-cd /path/to/hermes-memory-compiler
+git clone <repo-url> HermesMemoryCompiler
+cd HermesMemoryCompiler
+```
+
+2. Ask the user where their vault (knowledge base target) lives. Then copy the HMC into it:
+
+```bash
+cp -r /path/to/HermesMemoryCompiler /path/to/your/vault/
+```
+
+3. Install the Hermes plugin via symlink:
+
+```bash
+cd /path/to/your/vault/HermesMemoryCompiler
 ln -s $(pwd)/hermes_memory_compiler ~/.hermes/plugins/hermes-memory-compiler
 ```
 
-3. Enable the plugin:
+4. Enable the plugin:
 
 ```bash
 hermes plugins enable hermes-memory-compiler
 ```
+
+5. Update `config.yaml` — set `wiki_path` to the user's actual knowledge directory if it differs from the default `knowledge`.
 
 ## Configuration
 
@@ -44,11 +74,15 @@ compiler:
   temperature: 0.3
   max_tokens: 4096
   max_turns: 30
+  context_article_threshold: 150
+  system_prompt: "compiler"
 query:
   temperature: 0.2
   max_tokens: 2048
 lint:
   structural_only: false
+  contradiction_temperature: 0.1
+  contradiction_max_tokens: 2048
 plugin:
   auto_flush: true
   auto_compile_hour: 18
@@ -72,9 +106,9 @@ Then copy-paste the output into your crontab (`crontab -e`):
 
 ```
 # Flush every 30 minutes
-*/30 * * * * cd /full/path/to/hermes-memory-compiler && python scripts/flush.py --all >> scripts/flush.log 2>&1
+*/30 * * * * cd /full/path/to/HermesMemoryCompiler && python scripts/flush.py --all >> scripts/flush.log 2>&1
 # Compile daily at 6 PM
-0 18 * * * cd /full/path/to/hermes-memory-compiler && python scripts/compile.py >> scripts/compile.log 2>&1
+0 18 * * * cd /full/path/to/HermesMemoryCompiler && python scripts/compile.py >> scripts/compile.log 2>&1
 ```
 
 **Note:** When `flush.py` runs after `auto_compile_hour` (default 18:00), it automatically
@@ -144,6 +178,15 @@ While chatting with Hermes, you can run knowledge-base operations directly:
 ├── config.yaml             # User configuration
 └── pyproject.toml          # Python dependencies
 ```
+
+## Why No RAG?
+
+> At personal knowledge base scale (50–500 articles), the LLM reading a structured index outperforms cosine similarity.
+> — Andrej Karpathy
+
+Embeddings find similar *words*; the LLM finds relevant *concepts*. When you ask "How do I handle auth redirects?", a vector search might return articles that mention "redirect" and "authentication." The LLM reading `knowledge/index.md` understands you are asking about **session flow**, **middleware patterns**, and **OAuth callbacks** — and selects the precise 3–10 articles that actually answer your question.
+
+RAG shines at massive scale (10,000+ documents). For a personal knowledge base compiled from your own conversations, structured indexing plus LLM reasoning is simpler, cheaper, and more accurate.
 
 ## License
 

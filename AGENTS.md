@@ -13,9 +13,24 @@ lint            = test suite     (health checks for consistency)
 queries         = runtime        (using the knowledge)
 ```
 
-> **Unified KB:** The knowledge base at `/home/d/Desktop/agenda/ObsidianVault/knowledge/` is shared between Hermes and Claude Code. Articles are tagged by source: `[Hermes]` for Hermes-compiled articles, `[ClaudeCode]` for Claude Code articles. Both agents must acquire the compilation lock (`.compile.lock`) before writing to the KB to prevent race conditions.
+> **Unified KB:** The knowledge base is configured via `wiki_path` in `config.yaml` (default: `knowledge/` relative to the project root). It is shared between Hermes and Claude Code. Articles are tagged by source: `[Hermes]` for Hermes-compiled articles, `[ClaudeCode]` for Claude Code articles. Both agents must acquire the compilation lock (`.compile.lock`) before writing to the KB to prevent race conditions.
 
 You don't manually organize your knowledge. You have conversations, and the LLM handles the synthesis, cross-referencing, and maintenance.
+
+---
+
+## Deploying the HMC
+
+When an agent sets up the Memory Compiler for a user:
+
+1. **Clone the HMC repository** to a working directory.
+2. **Ask the user where their vault lives** — this is the directory containing (or intended to contain) `daily/`, `knowledge/`, and `config.yaml`.
+3. **Copy the HMC into the vault** so that the scripts, plugin package, and config live alongside the user's knowledge base.
+4. **Install the plugin** via symlink: `ln -s $(pwd)/hermes_memory_compiler ~/.hermes/plugins/hermes-memory-compiler`
+5. **Enable the plugin**: `hermes plugins enable hermes-memory-compiler`
+6. **Update `config.yaml`** — set `wiki_path` to the user's actual knowledge directory if it differs from the default `knowledge`.
+
+The HMC is designed to be cloned and deployed, not used in-place from the source repo. Each user's vault is their own — the agent adapts the HMC to wherever the user says it should live.
 
 ---
 
