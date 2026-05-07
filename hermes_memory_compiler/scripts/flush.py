@@ -28,6 +28,7 @@ sys.path.insert(0, str(_HERE.parent))
 from scripts.config import KNOWLEDGE_DIR, ROOT_DIR, cfg, ollama_completion
 sys.path.insert(0, str(ROOT_DIR))
 from hermes_memory_compiler.lock import LockHeldError, acquire_lock, release_lock
+from hermes_memory_compiler._common import get_hermes_home
 from scripts.utils import atomic_json_write, hash_file
 
 SCRIPTS_DIR = ROOT_DIR / "scripts"
@@ -220,10 +221,15 @@ def flush_session(session_id: str, dry_run: bool = False) -> Optional[str]:
         print(f"Skipping {session_id}: flushed within last {DEDUP_WINDOW_SECONDS} seconds.")
         return None
 
-    sessions_dir = Path.home() / ".hermes" / "sessions"
-    marker_dir = Path(
-        cfg("plugin.marker_dir", str(Path.home() / ".hermes" / "plugins" / "hermes-memory-compiler" / "markers"))
-    ).expanduser()
+    sessions_dir = get_hermes_home() / "sessions"
+    _marker_dir_cfg = cfg("plugin.marker_dir", str(get_hermes_home() / "plugins" / "hermes-memory-compiler" / "markers"))
+    marker_dir = Path(_marker_dir_cfg)
+    if not marker_dir.is_absolute():
+        marker_dir = marker_dir.expanduser()
+        # If expanduser landed in fake HOME, fix ~/.hermes paths
+        if _marker_dir_cfg.startswith("~/.hermes"):
+            suffix = _marker_dir_cfg[len("~/.hermes"):].lstrip("/")
+            marker_dir = get_hermes_home() / suffix if suffix else get_hermes_home()
     daily_dir = ROOT_DIR / "daily"
 
     session_path = sessions_dir / f"session_{session_id}.json"
@@ -331,7 +337,7 @@ def flush_all(dry_run: bool = False) -> list[str]:
 
     Returns a list of session_ids that were successfully flushed.
     """
-    sessions_dir = Path.home() / ".hermes" / "sessions"
+    sessions_dir = get_hermes_home() / "sessions"
     flushed: list[str] = []
 
     if not sessions_dir.exists():

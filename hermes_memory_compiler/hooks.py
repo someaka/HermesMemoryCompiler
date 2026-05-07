@@ -16,11 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from . import marker
-from ._common import DEFAULT_MARKER_DIR, resolve_project_root
+from ._common import DEFAULT_MARKER_DIR, get_hermes_home, resolve_project_root
 
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = resolve_project_root()
+_PLUGIN_DIR = Path(__file__).resolve().parent
 _CONFIG_PATH = _PROJECT_ROOT / "config.yaml"
 
 def _load_config() -> dict[str, Any]:
@@ -39,13 +40,52 @@ def _load_config() -> dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+def _resolve_path(value: str | None, default: Path) -> Path:
+    """Resolve a config path, expanding ``~`` and ``~/.hermes`` correctly.
+
+    When ``HOME`` is redirected (e.g. kanban-worker profile mode),
+    ``Path.expanduser()`` uses the fake ``HOME`` and produces wrong
+    paths.  We intercept ``~/.hermes`` prefixes and resolve them via
+    :func:`get_hermes_home` so the plugin stays consistent with the
+    host Hermes installation.
+
+    Relative paths (e.g. ``"knowledge"``) are resolved against the
+    project root so they work regardless of the current working directory.
+    """
+    if value is None:
+        return default
+    path = Path(value)
+    # Absolute paths are returned as-is.
+    if path.is_absolute():
+        return path
+    # Expand ``~`` using the real user home, not the subprocess HOME.
+    expanded = path.expanduser()
+    # If the expansion landed inside the fake profile home, fix it.
+    hermes_home = get_hermes_home()
+    try:
+        expanded.relative_to(Path.home())
+        # It's under the (possibly fake) HOME directory.  If the
+        # original string started with ``~/.hermes``, make sure it
+        # resolves to the real Hermes home.
+        if value.startswith("~/.hermes"):
+            suffix = value[len("~/.hermes"):].lstrip("/")
+            return hermes_home / suffix if suffix else hermes_home
+    except ValueError:
+        pass
+    # If the expanded path is still relative (e.g. "knowledge"), resolve
+    # it against the project root so it works from any cwd.
+    if not expanded.is_absolute():
+        return _PROJECT_ROOT / expanded
+    return expanded
+
+
 def _get_plugin_config() -> dict[str, Any]:
     """Return the ``plugin`` section of the config with sensible defaults."""
     cfg = _load_config()
     plugin_cfg = cfg.get("plugin", {})
     return {
-        "wiki_path": Path(plugin_cfg.get("wiki_path", str(_PROJECT_ROOT / "knowledge"))).expanduser(),
-        "marker_dir": Path(plugin_cfg.get("marker_dir", str(DEFAULT_MARKER_DIR))).expanduser(),
+        "wiki_path": _resolve_path(plugin_cfg.get("wiki_path"), _PROJECT_ROOT / "knowledge"),
+        "marker_dir": _resolve_path(plugin_cfg.get("marker_dir"), DEFAULT_MARKER_DIR),
         "max_context_chars": int(plugin_cfg.get("max_context_chars", 20000)),
         "max_log_lines": int(plugin_cfg.get("max_log_lines", 30)),
         "auto_flush": bool(plugin_cfg.get("auto_flush", True)),
@@ -65,7 +105,7 @@ def _flush_session(session_id: str, cfg: dict[str, Any]) -> None:
     env["HERMES_FLUSH_IN_PROGRESS"] = "1"
 
     result = subprocess.run(
-        [sys.executable, str(_PROJECT_ROOT / "scripts" / "flush.py"), "--session", session_id],
+        [sys.executable, str(_PLUGIN_DIR / "scripts" / "flush.py"), "--session", session_id],
         cwd=_PROJECT_ROOT,
         env=env,
         capture_output=True,
@@ -263,9 +303,13 @@ def on_session_finalize(
         return
 
     # Check if there are messages to flush
+    # A marker existing means on_post_llm_call fired at least once,
+    # meaning there was at least one successful turn worth flushing.
+    # Note: message_count in the marker is a position pointer managed
+    # by flush.py, not a turn counter — it starts at 0.
     marker_data = marker.read_marker(session_id, marker_dir=marker_dir)
     try:
-        if marker_data and marker_data.get("message_count", 0) > 0:
+        if marker_data is not None:
             _flush_session(session_id, cfg)
     finally:
         marker.delete_marker(session_id, marker_dir=marker_dir)

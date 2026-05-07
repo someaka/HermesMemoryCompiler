@@ -1,11 +1,26 @@
 """Configuration loader and Ollama API client for Hermes Memory Compiler."""
 from __future__ import annotations
 
+import os
 import pathlib
 from typing import Any
 
 import requests
 import yaml
+
+
+def get_hermes_home() -> pathlib.Path:
+    """Return the Hermes home directory, honoring HERMES_HOME env var.
+
+    Falls back to ``pathlib.Path.home() / '.hermes'`` when HERMES_HOME is unset.
+    This mirrors ``hermes_constants.get_hermes_home()`` so the plugin
+    stays consistent with the host Hermes installation.
+    """
+    val = os.environ.get("HERMES_HOME", "").strip()
+    if val:
+        return pathlib.Path(val)
+    return pathlib.Path.home() / ".hermes"
+
 
 def _load_config(path: pathlib.Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
@@ -53,10 +68,18 @@ _this_file = pathlib.Path(__file__).resolve()
 SCRIPTS_DIR = _this_file.parent
 _wiki = cfg("plugin.wiki_path", str(ROOT_DIR / "knowledge"))
 KNOWLEDGE_DIR = ROOT_DIR / _wiki if not pathlib.Path(_wiki).is_absolute() else pathlib.Path(_wiki)
-KNOWLEDGE_DIR = KNOWLEDGE_DIR.expanduser().resolve()
+if not KNOWLEDGE_DIR.is_absolute():
+    KNOWLEDGE_DIR = KNOWLEDGE_DIR.expanduser()
+    if _wiki.startswith("~/.hermes"):
+        suffix = _wiki[len("~/.hermes"):].lstrip("/")
+        KNOWLEDGE_DIR = get_hermes_home() / suffix if suffix else get_hermes_home()
+KNOWLEDGE_DIR = KNOWLEDGE_DIR.resolve()
 REPORTS_DIR = ROOT_DIR / "reports"
 STATE_PATH = SCRIPTS_DIR / "state.json"
 LAST_FLUSH_PATH = SCRIPTS_DIR / "last-flush.json"
+
+# Default marker directory (Hermes-home aware)
+DEFAULT_MARKER_DIR = get_hermes_home() / "plugins" / "hermes-memory-compiler" / "markers"
 
 
 def ollama_completion(

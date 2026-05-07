@@ -1,9 +1,25 @@
 """Shared utilities for the Hermes Memory Compiler plugin."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-DEFAULT_MARKER_DIR = Path("~/.hermes/plugins/hermes-memory-compiler/markers").expanduser()
+
+def get_hermes_home() -> Path:
+    """Return the Hermes home directory, honoring HERMES_HOME env var.
+
+    Falls back to ``Path.home() / '.hermes'`` when HERMES_HOME is unset.
+    This mirrors ``hermes_constants.get_hermes_home()`` so the plugin
+    stays consistent with the host Hermes installation — especially
+    important in profile mode where ``HOME`` may be redirected.
+    """
+    val = os.environ.get("HERMES_HOME", "").strip()
+    if val:
+        return Path(val)
+    return Path.home() / ".hermes"
+
+
+DEFAULT_MARKER_DIR = get_hermes_home() / "plugins" / "hermes-memory-compiler" / "markers"
 
 
 def resolve_project_root(max_depth: int = 3) -> Path:
