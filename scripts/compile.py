@@ -38,6 +38,15 @@ AGENTS_FILE = ROOT_DIR / "AGENTS.md"
 CONCEPTS_DIR = KNOWLEDGE_DIR / "concepts"
 CONNECTIONS_DIR = KNOWLEDGE_DIR / "connections"
 
+
+class CompilationError(Exception):
+    """A compilation that could not complete."""
+
+    def __init__(self, log_name: str, detail: str) -> None:
+        super().__init__(f"{log_name}: {detail}")
+        self.log_name = log_name
+        self.detail = detail
+
 # OpenAI-compatible tool definitions for the compiler
 TOOLS = [
     {
@@ -295,7 +304,9 @@ Read the daily log above and compile it into wiki articles following the schema 
     ]
 
     max_turns = int(cfg("compiler.max_turns", 30))
-    for turn in range(1, max_turns + 1):
+    turn = 0
+    while max_turns == 0 or turn < max_turns:
+        turn += 1
         try:
             resp = ollama_completion(
                 messages=messages,
@@ -304,13 +315,11 @@ Read the daily log above and compile it into wiki articles following the schema 
                 max_tokens=int(cfg("compiler.max_tokens", 4096)),
             )
         except RuntimeError as e:
-            print(f"  API error: {e}")
-            return
+            raise CompilationError(log_path.name, f"API error: {e}") from e
 
         choices = resp.get("choices")
         if not choices:
-            print("  API error: Ollama returned empty choices")
-            return
+            raise CompilationError(log_path.name, "Ollama returned empty choices")
         choice = choices[0]
         message = choice.get("message") or {}
         content = message.get("content") or ""
@@ -336,8 +345,7 @@ Read the daily log above and compile it into wiki articles following the schema 
                 "content": result,
             })
     else:
-        print(f"  Warning: reached max_turns ({max_turns})")
-        return
+        raise CompilationError(log_path.name, f"reached max_turns ({max_turns})")
 
     # Update state
     rel_path = f"daily/{log_path.name}"
@@ -397,9 +405,15 @@ def main():
         if args.dry_run:
             return
 
+        failed = []
         for i, log_path in enumerate(to_compile, 1):
             print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
-            compile_daily_log(log_path, state)
+            try:
+                compile_daily_log(log_path, state)
+            except CompilationError as e:
+                print(f"  ERROR: {e.detail}")
+                failed.append(log_path.name)
+                continue
 
             if f"daily/{log_path.name}" not in state.get("ingested", {}):
                 print(f"  Warning: compilation did not complete for {log_path.name}; skipping archive.")
@@ -418,6 +432,12 @@ def main():
         articles = list(list_wiki_articles())
         print(f"\nCompilation complete.")
         print(f"Knowledge base: {len(articles)} articles")
+
+        if failed:
+            print(f"\nFAILURES ({len(failed)}):")
+            for name in failed:
+                print(f"  - {name}")
+            sys.exit(3)
     finally:
         release_lock(KNOWLEDGE_DIR)
 
