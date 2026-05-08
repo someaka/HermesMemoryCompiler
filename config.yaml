@@ -11,7 +11,7 @@ flush:
 compiler:
   temperature: 0.3
   max_tokens: 4096
-  max_turns: 30
+  max_turns: 0
   context_article_threshold: 150
   system_prompt: "compiler"
 

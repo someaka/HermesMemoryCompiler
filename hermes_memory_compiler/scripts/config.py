@@ -95,7 +95,7 @@ def ollama_completion(
     """
     base_url = cfg("ollama.base_url", "http://localhost:11434/v1")
     base_url = base_url.rstrip("/")
-    model = cfg("ollama.model", "kimi-k2.6:cloud")
+    model = cfg("ollama.model", "deepseek-v4-pro:cloud")
 
     payload: dict[str, Any] = {
         "model": model,

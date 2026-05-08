@@ -210,18 +210,8 @@ def _maybe_trigger_compile(daily_path: Path) -> None:
         release_lock(KNOWLEDGE_DIR)
 
 
-def flush_session(session_id: str, dry_run: bool = False) -> Optional[str]:
-    """
-    Flush a single session.
-
-    Returns the session_id if a summary was generated and appended,
-    None if nothing was flushed or FLUSH_OK was returned.
-    """
-    if _should_skip_dedup(session_id):
-        print(f"Skipping {session_id}: flushed within last {DEDUP_WINDOW_SECONDS} seconds.")
-        return None
-
-    sessions_dir = get_hermes_home() / "sessions"
+def _get_marker_dir() -> Path:
+    """Return the resolved marker directory path."""
     _marker_dir_cfg = cfg("plugin.marker_dir", str(get_hermes_home() / "plugins" / "hermes-memory-compiler" / "markers"))
     marker_dir = Path(_marker_dir_cfg)
     if not marker_dir.is_absolute():
@@ -230,6 +220,21 @@ def flush_session(session_id: str, dry_run: bool = False) -> Optional[str]:
         if _marker_dir_cfg.startswith("~/.hermes"):
             suffix = _marker_dir_cfg[len("~/.hermes"):].lstrip("/")
             marker_dir = get_hermes_home() / suffix if suffix else get_hermes_home()
+    return marker_dir
+
+
+def flush_session(session_id: str, dry_run: bool = False) -> Optional[str]:
+    """
+    Flush a single session: read session file, compare marker, call Ollama, append to daily log.
+
+    Returns the session_id if a flush was performed, None otherwise.
+    """
+    if _should_skip_dedup(session_id):
+        print(f"Skipping {session_id}: flushed within last {DEDUP_WINDOW_SECONDS} seconds.")
+        return None
+
+    sessions_dir = get_hermes_home() / "sessions"
+    marker_dir = _get_marker_dir()
     daily_dir = ROOT_DIR / "daily"
 
     session_path = sessions_dir / f"session_{session_id}.json"
@@ -333,11 +338,12 @@ def flush_session(session_id: str, dry_run: bool = False) -> Optional[str]:
 
 def flush_all(dry_run: bool = False) -> list[str]:
     """
-    Scan all session files and flush any with new messages.
+    Scan session files that have existing markers and flush any with new messages.
 
     Returns a list of session_ids that were successfully flushed.
     """
     sessions_dir = get_hermes_home() / "sessions"
+    marker_dir = _get_marker_dir()
     flushed: list[str] = []
 
     if not sessions_dir.exists():
@@ -346,6 +352,9 @@ def flush_all(dry_run: bool = False) -> list[str]:
 
     for session_file in sorted(sessions_dir.glob("session_*.json")):
         session_id = session_file.stem.replace("session_", "")
+        marker_path = marker_dir / f"{session_id}.json"
+        if not marker_path.exists():
+            continue
         result = flush_session(session_id, dry_run=dry_run)
         if result:
             flushed.append(result)
